@@ -1,0 +1,61 @@
+name: Production QA
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  qa:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Source build / pre-deploy gate
+        run: |
+          npm install
+          npm run build
+      - name: Probe canonical production URL
+        id: probe
+        shell: bash
+        run: |
+          set +e
+          code=$(curl -L -s -o /dev/null -w "%{http_code}" --max-time 20 https://tasksk028.vercel.app)
+          echo "http_code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = "200" ]; then echo "live=true" >> "$GITHUB_OUTPUT"; else echo "live=false" >> "$GITHUB_OUTPUT"; fi
+          exit 0
+      - name: Check exact-commit Vercel status
+        id: vercel
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set +e
+          json=$(gh api repos/${{ github.repository }}/commits/${{ github.sha }}/status)
+          echo "$json" > vercel-status.json
+          state=$(echo "$json" | jq -r '[.statuses[] | select((.context|ascii_downcase|contains("vercel")))] | first | .state // "missing"')
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          if [ "$state" = "success" ]; then echo "verified=true" >> "$GITHUB_OUTPUT"; else echo "verified=false" >> "$GITHUB_OUTPUT"; fi
+          exit 0
+      - name: Waiting for Vercel Git integration
+        if: steps.vercel.outputs.verified != 'true'
+        run: echo "Exact-current-main Vercel SUCCESS not present; release QA intentionally not executed."
+      - name: Install Playwright Chromium
+        if: steps.vercel.outputs.verified == 'true' && steps.probe.outputs.live == 'true'
+        run: npx playwright install --with-deps chromium
+      - name: Real Production QA
+        if: steps.vercel.outputs.verified == 'true' && steps.probe.outputs.live == 'true'
+        env:
+          PRODUCTION_URL: https://tasksk028.vercel.app
+        run: npm run qa | tee qa-summary.json
+      - name: Upload QA evidence
+        if: always() && steps.vercel.outputs.verified == 'true' && steps.probe.outputs.live == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-qa-evidence
+          path: |
+            qa-summary.json
+            qa-*.png
+            vercel-status.json
